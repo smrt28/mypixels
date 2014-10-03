@@ -44,7 +44,7 @@ config = {
     'tab_color_fg': '#888',
     'tab_color_fg_selected': '#fff',
     'tablist_font': 'Liberation Mono 7',
-    'term_font': 'Terminus 8',
+    'term_font_new': 'Terminus',
     'default_tab_title': '',
     'scrollback_lines': 1000,
     'term_opacity': 0.1,
@@ -102,6 +102,7 @@ class MyPixels:
         self.window = gtk.Window()
         self.window.set_title("mypixels")
         self.window.set_border_width(0)
+        self.window.set_decorated(False)
 
         self.window.connect("delete-event", self.quit_request)
 
@@ -237,7 +238,7 @@ class MyPixels:
 
         self.notebook.grab_focus()
 
-        self.forcedHideTabs = False
+        self.forcedHideTabs = True
 
         self.tabs = {}
 
@@ -292,12 +293,19 @@ class MyPixels:
         tab.connect("eof", self.child_exited)
         tab.connect("window-title-changed", self.window_title_changed)
 
-        tab.set_font(pango.FontDescription(config["term_font"]))
+        font = pango.FontDescription()
+        font.set_family(config['term_font_new'])
+        font.set_size(9 * pango.SCALE)
+        font.set_weight(pango.WEIGHT_BOLD)
+        font.set_stretch(pango.STRETCH_NORMAL)
+        tab.set_font(font)
+
         tab.set_scrollback_lines(config['scrollback_lines'])
 
         tab.set_property("background-transparent", True)
         tab.set_background_tint_color(gtk.gdk.color_parse(config['bg_tint_color']))
         tab.set_background_saturation(config['term_opacity'])
+        tab.set_allow_bold(True)
 
         if self.palette:
             tab.set_colors(self.fg_color, self.bg_color, self.palette)
