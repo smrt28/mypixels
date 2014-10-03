@@ -1,0 +1,603 @@
+#!/usr/bin/env python2
+""" mypixels - A low clutter, python-gtk based terminal emulator.
+"""
+# Glued together in free time by Filip Volejnik: f.volejnik at google mail
+# use as you will (but please leave a credit line)
+# heavily inspired by uzbl-tabbed.py
+# Solarized colors are a great piece of work of Ethan Schoonover
+# TODO: Timer for tablist updates - optionally set to refresh if using some dynamic status
+# TODO: Write to buffer - a small box floating somewhere that'll display what user's writing (in parallel with the console).
+# An ability to replay the keystrokes on other console.
+# TODO: CSSH-like multi-input with console pinning -
+# enable multi-input (keystroke forwarding) to pinned consoles (via a hidden/shown focused edit box)
+# TODO: Tagging of consoles - and grouping via those tags
+import gtk
+import gobject
+import vte
+import pango
+import types
+import yaml
+import os.path
+import sys
+import cgi
+
+def clock():
+    from time import localtime, strftime
+    return "<span foreground = '#966'>%s</span> " % strftime("%H:%M", localtime())
+
+callables = {
+    'clock' : clock
+    }
+
+max_groups = 8
+
+# Default config
+config = {
+    'tablist_background': "#303030", # Tablist background
+    'multiline_tabs': True,
+    'focus_new_tabs': True,
+    'tab_prepend': 'clock', # name of callback function that generates pango markup text appended to tab list before the tabs
+    'tab_append': None,  # the same, but appended after tab list
+    'tab_format': '<span %(color)s>[%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
+    'tab_color_bg': '#303030',
+    'tab_color_bg_selected': '#505020',
+    'tab_color_fg': '#888',
+    'tab_color_fg_selected': '#fff',
+    'tablist_font': 'Liberation Mono 7',
+    'term_font': 'Terminus 8',
+    'default_tab_title': '',
+    'scrollback_lines': 1000,
+    'term_opacity': 0.1,
+    'bg_tint_color': '#140008',
+    'foreground_color': '#BBB',
+    'background_color': '#000',
+    'hide_single_tab': False,
+    'tablist_top': True,
+    'tab_title_max_length': 16, # -1 to disable this
+    'tab_title_short_current': 32, # shorten the selected tab title (False - don't, True - do, int > 0 current title max length)
+    'tab_title_shorten_start': False, # shorten so that end of the text is visible, not start
+    # TODO:
+        'autohide_delay': -1, # if positive, a delay in miliseconds to wait before hiding the tab bar
+    'default_width': 640,
+    'default_height': 480,
+
+    # choosable tab colors (grouping)
+    'col_0': '#b58900',
+    'col_1': '#cb4b16',
+    'col_2': '#dc322f',
+    'col_3': '#d33682',
+    'col_4': '#6c71c4',
+    'col_5': '#268bd2',
+    'col_6': '#2aa198',
+    'col_7': '#859900'
+    };
+
+# Used for quick selection via <Mod1>[0-9]
+num2key = (
+    gtk.keysyms._1,
+    gtk.keysyms._2,
+    gtk.keysyms._3,
+    gtk.keysyms._4,
+    gtk.keysyms._5,
+    gtk.keysyms._6,
+    gtk.keysyms._7,
+    gtk.keysyms._8,
+    gtk.keysyms._9,
+    gtk.keysyms._0,
+    );
+
+def counter():
+    """ Tab ID generator """
+    i = 1
+    while True:
+        yield i
+        i += 1
+
+class MyPixels:
+    def __init__(self):
+        # counter used for tab id's
+        self.counter = counter()
+
+        # create a window to hold the thing
+        self.window = gtk.Window()
+        self.window.set_title("mypixels")
+        self.window.set_border_width(0)
+
+        self.window.connect("delete-event", self.quit_request)
+
+        # Default key bindings
+        self.keybinds = [
+            # Key, mods, callback, params
+            # tab repositioning
+            (gtk.keysyms.Left,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_prev_tab, None),
+            (gtk.keysyms.Right, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_next_tab, None),
+            (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_prev_tab, -1),
+            (gtk.keysyms.End,   gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_next_tab, -1),
+
+            # tab switching
+            (gtk.keysyms.Left,  gtk.gdk.MOD1_MASK, self.prev_tab, None),
+            (gtk.keysyms.Right, gtk.gdk.MOD1_MASK, self.next_tab, None),
+            (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK, self.prev_tab, -1),
+            (gtk.keysyms.End,   gtk.gdk.MOD1_MASK, self.next_tab, -1),
+
+            (gtk.keysyms.f, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.prev_tab, None),
+            (gtk.keysyms.b, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.next_tab, None),
+
+            # tab open/close
+            (gtk.keysyms.x, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
+            (gtk.keysyms.z, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.new_tab, None),
+            (gtk.keysyms.t, gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK, self.new_tab, None),
+
+            # font size - enlarge/shrink
+            (gtk.keysyms.KP_Add     , gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.enlarge_font, None),
+            (gtk.keysyms.KP_Subtract, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.shrink_font, None),
+
+            # Forced hide tabs toggle
+            (gtk.keysyms.v, gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK, self.toggle_hide_tabs, None),
+
+            # Tab group/color switcher
+            (gtk.keysyms.braceleft, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, 1),
+            (gtk.keysyms.braceright, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, -1),
+
+            # (gtk.keysyms.braceright, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, -1),
+            ];
+
+        # default font size - zero is ignored
+        self.fontsize = 0
+
+        # fast direct tab selection via <Mod1>+1-0
+        for i in range(0, 10):
+            self.keybinds.append((num2key[i], gtk.gdk.MOD1_MASK, self.goto_tab, i));
+
+        # handle config
+        try:
+            with open(os.path.expanduser("~/.mypixels")) as f:
+                myconfig = yaml.load(f)
+
+            for k in config.keys():
+                if k in myconfig:
+                    config[k] = myconfig[k]
+        except:
+            # if no config is found, write the default mappings into the config
+            self.write_config()
+
+        # convert the call config vars to callables
+        if 'palette' in config:
+            colors = config['palette'].split(':')
+            self.palette = []
+            for color in colors:
+                if color:
+                    self.palette.append (gtk.gdk.color_parse (color))
+        else:
+            self.palette = None
+
+        self.fg_color = gtk.gdk.color_parse (config['foreground_color'])
+        self.bg_color = gtk.gdk.color_parse (config['background_color'])
+
+        vbox = gtk.VBox()
+        self.vbox = vbox
+        self.vbox.set_resize_mode(gtk.RESIZE_IMMEDIATE)
+        self.window.add(vbox)
+
+        ebox = gtk.EventBox()
+        self.ebox = ebox
+
+        self.tablist = gtk.Label()
+
+        fontdesc = pango.FontDescription(config["tablist_font"])
+        self.tablist.modify_font(fontdesc)
+        self.tablist.set_use_markup(True)
+        self.tablist.set_justify(gtk.JUSTIFY_LEFT)
+        self.tablist.set_line_wrap(False)
+        self.tablist.set_selectable(False)
+        self.tablist.set_padding(2,2)
+        self.tablist.set_alignment(0,0)
+        self.tablist.set_ellipsize(pango.ELLIPSIZE_END)
+        self.tablist.set_text(" ")
+        self.tablist.show()
+
+        ebox.add(self.tablist)
+        ebox.show()
+        bgcolor = gtk.gdk.color_parse(config['tablist_background'])
+        ebox.modify_bg(gtk.STATE_NORMAL, bgcolor)
+
+        # gtk notebook that holds the vterms
+        self.notebook = gtk.Notebook()
+        self.notebook.set_show_tabs(False)
+
+        self.notebook.set_show_border(False)
+        self.notebook.set_scrollable(True)
+        self.notebook.set_border_width(0)
+
+        self.notebook.connect("page-removed", self.tab_closed)
+        self.notebook.connect("switch-page", self.tab_changed)
+        self.notebook.connect("page-added", self.tab_opened)
+        self.notebook.connect("page-reordered", self.tab_reordered)
+
+        vbox.pack_start(self.notebook, True, True, 0)
+        vbox.pack_start(self.ebox, False, False, 0)
+
+        if config["tablist_top"]:
+            vbox.reorder_child(self.ebox, 0)
+            vbox.reorder_child(self.notebook, 1)
+        else:
+            vbox.reorder_child(self.notebook, 1)
+            vbox.reorder_child(self.ebox, 2)
+
+        self.notebook.show()
+
+        self.window.connect("key-press-event", self.key_pressed)
+        self.window.connect("configure-event", self.resize_request)
+
+        # window fixup before we create tab
+        self.window.resize(config["default_width"], config["default_height"])
+
+        self.vbox.show()
+        self.window.show()
+
+        self.notebook.grab_focus()
+
+        self.forcedHideTabs = False
+
+        self.tabs = {}
+
+    def write_config(self):
+        with open(os.path.expanduser('~/.mypixels'), 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+
+    def resize_request(self, wnd, event):
+        self.update_tablist()
+
+    def key_pressed(self, wnd, event):
+        if event.type != gtk.gdk.KEY_PRESS:
+            return False
+
+        # skim through the bindings
+        mods = event.state & gtk.accelerator_get_default_mod_mask()
+        keyval = gtk.gdk.keyval_to_lower(event.keyval)
+
+        # TODO: Could accelerate this by placing the key combination into dict
+        for bind in self.keybinds:
+            if (bind[0] == keyval) and (bind[1] & mods == bind[1]):
+                bind[2](bind[3])
+                return True
+
+        return False
+
+    def enlarge_font(self, param):
+        self.zoom(True)
+
+    def shrink_font(self, param):
+        self.zoom(False)
+
+    def zoom(self, zoom):
+        for idx, tab in enumerate(self.notebook):
+            pangodesc = tab.get_font()
+            fontsize = pangodesc.get_size()
+
+            if fontsize > pango.SCALE and not zoom:
+                fontsize -= pango.SCALE
+            elif zoom:
+                fontsize += pango.SCALE
+
+            pangodesc.set_size(fontsize)
+            self.fontsize=fontsize
+            tab.set_font(pangodesc)
+
+
+    def new_tab(self, command=None, tnext=False, title="", cmd=None):
+        # new tab instance
+        tab = vte.Terminal()
+        tab.connect("child-exited", self.child_exited)
+        tab.connect("eof", self.child_exited)
+        tab.connect("window-title-changed", self.window_title_changed)
+
+        tab.set_font(pango.FontDescription(config["term_font"]))
+        tab.set_scrollback_lines(config['scrollback_lines'])
+
+        tab.set_property("background-transparent", True)
+        tab.set_background_tint_color(gtk.gdk.color_parse(config['bg_tint_color']))
+        tab.set_background_saturation(config['term_opacity'])
+
+        if self.palette:
+            tab.set_colors(self.fg_color, self.bg_color, self.palette)
+
+        tid = self.counter.next()
+
+        if self.fontsize:
+            pangodesc = tab.get_font()
+            pangodesc.set_size(self.fontsize)
+            tab.set_font(pangodesc)
+
+        # The empty argv list is a fix for zsh segv...
+        if (cmd):
+            tab.fork_command(cmd[0], argv=cmd)
+        elif (self.command):
+            tab.fork_command(self.command[0], argv=self.command)
+        else:
+            tab.fork_command(argv=[""])
+
+        tab.show()
+
+        if (command):
+            tab.feed_child(command)
+
+        self.notebook.insert_page(tab, position=tnext and self.notebook.get_current_page() + 1 or -1)
+        self.notebook.set_tab_reorderable(tab, True)
+
+        if not title:
+            title = config["default_tab_title"]
+
+        self.tabs[tab] = {"title": title, "id": tid}
+        self.update_tablist()
+
+        tab.grab_focus()
+
+    def update_tablist(self):
+        if (self.notebook.get_n_pages() <= 1 and config["hide_single_tab"]) \
+            or self.forcedHideTabs:
+            self.tablist.hide()
+            return
+
+        # TODO: refit the window
+        self.tablist.show()
+
+        multiline_tabs = config['multiline_tabs']
+
+        multiline = []
+        pango = ""
+
+        if config['tab_prepend']:
+            pango = callables[config['tab_prepend']]()
+
+        curidx = self.notebook.get_current_page()
+
+        tab_format = config['tab_format']
+        max_title_len = config['tab_title_max_length']
+
+        for idx, tab in enumerate(self.notebook):
+            colfg = config["tab_color_fg"]
+            colbg = config["tab_color_bg"]
+
+            tidx = idx + 1
+            tid = tidx
+            tname = ""
+
+            if tab in self.tabs:
+                params = self.tabs[tab]
+                tid = params["id"]
+                tname = params["title"]
+
+            if not tname:
+                tname = str(tid)
+
+            if (idx != curidx):
+                if max_title_len > 0 and len(tname) > max_title_len:
+                    if config['tab_title_shorten_start']:
+                        tname = "\xe2\x80\xa6" + tname[len(tname)-max_title_len:]
+                    else:
+                        tname = tname[:max_title_len] + "\xe2\x80\xa6"
+            else:
+                colfg = config["tab_color_fg_selected"]
+                colbg = config["tab_color_bg_selected"]
+
+                cname = '_selected'
+                mt_cur = max_title_len
+                sh_cur = config['tab_title_short_current']
+
+                if (type(sh_cur) == types.IntType):
+                    mt_cur = sh_cur
+                    sh_cur = True
+
+                if sh_cur and mt_cur > 0 and len(tname) > mt_cur:
+                   if config['tab_title_shorten_start']:
+                       tname = "\xe2\x80\xa6" + tname[len(tname) - mt_cur:]
+                   else:
+                       tname = tname[:mt_cur] + "\xe2\x80\xa6"
+
+            # now if we have group set for the tab, override
+            if tab in self.tabs:
+                grp = self.tabs[tab].get("group", None)
+            else:
+                grp = None
+
+            if grp:
+                colfg = config["col_%d" % grp]
+
+            color = "foreground=\"%s\" background=\"%s\"" % (colfg, colbg)
+
+            # fixup title - dangerous chars
+            tname = cgi.escape(tname)
+
+            if multiline_tabs:
+                opango = pango
+
+                pango += tab_format % locals()
+
+                self.tablist.set_markup(pango)
+                listwidth = self.tablist.get_layout().get_pixel_size()[0]
+                winwidth = self.window.get_size()[0]
+
+                if listwidth > (winwidth - 20):
+                    if opango != "":
+                        multiline.append(opango)
+
+                    pango = tab_format % locals()
+            else:
+                pango += tab_format % locals()
+
+        if (config['tab_append']):
+            pango += " " + callables[config['tab_append']]()
+
+        if multiline_tabs:
+            multiline.append(pango)
+            self.tablist.set_markup('&#10;'.join(multiline))
+        else:
+            self.tablist.set_markup(pango)
+
+
+    def next_tab(self, skip=1, move=False):
+        """ Focuses next tab. If skip is negative, focuses last tab.
+        If move is true, moves the tab to the place (otherwise it just focuses)
+        """
+        if not skip:
+            skip = 1
+
+        ntabs = self.notebook.get_n_pages()
+
+        if (ntabs <= 0):
+            return
+
+        if skip < 0:
+            tabn = ntabs - 1
+        else:
+            tabn = (self.notebook.get_current_page() + skip) % ntabs
+
+        self.goto_tab(tabn, move)
+
+    def prev_tab(self, skip=1, move=False):
+        """ Focuses previous tab. If skip is negative, focuses first tab.
+        If move is true, moves the tab to the place (otherwise it just focuses)
+        """
+        if not skip:
+            skip = 1
+
+        ntabs = self.notebook.get_n_pages()
+
+        if (ntabs <= 0):
+            return
+
+        if skip < 0:
+            tabn = 0
+        else:
+            tabn = (self.notebook.get_current_page() - skip) % ntabs
+
+        while (tabn < 0):
+            tabn += ntabs
+
+        self.goto_tab(tabn, move)
+
+    def move_next_tab(self, skip=1):
+        """ Like next_tab, but moves the current tab to the place """
+        self.next_tab(skip, move=True)
+
+    def move_prev_tab(self, skip=1):
+        """ Like next_tab, but moves the current tab to the place """
+        self.prev_tab(skip, move=True)
+
+    def goto_tab(self, tabn, move=False):
+        if move:
+            idx = self.notebook.get_current_page()
+            tab = self.notebook.get_nth_page(idx)
+            self.notebook.reorder_child(tab, tabn)
+
+        self.notebook.set_current_page(tabn)
+        self.update_tablist()
+
+
+    def toggle_hide_tabs(self, tabn=None):
+        self.forcedHideTabs = not self.forcedHideTabs
+        self.update_tablist()
+
+    def close_tab(self, tabn=None):
+        # TODO: What if this ended when not a current page?
+        if not tabn:
+            tabn = self.notebook.get_current_page()
+
+        if (tabn >= 0):
+            self.notebook.remove_page(tabn)
+
+        if (self.notebook.get_n_pages() <= 0):
+            self.quit_request()
+        else:
+            tabn = self.notebook.get_current_page()
+            # refocus
+            self.notebook.set_current_page(tabn)
+
+        self.update_tablist()
+
+    def tab_closed(self, notebook, tab, index):
+        del self.tabs[tab]
+
+    def child_exited(self, term):
+        self.close_tab()
+
+    def window_title_changed(self, term):
+        self.tabs[term]['title'] = term.get_window_title()
+        self.update_tablist()
+
+    def tab_opened(self, notebook, tab, index):
+        if config["focus_new_tabs"]:
+            self.notebook.set_focus_child(tab)
+            self.notebook.set_current_page(index)
+        else:
+            oldindex = self.notebook.get_current_page()
+
+            if oldindex < 0:
+                oldindex = index
+
+            oldtab = self.notebook.get_nth_page(oldindex)
+            self.notebook.set_focus_child(oldtab)
+            self.notebook.set_current_page(oldindex)
+
+    def tab_changed(self, notebook, tab, index):
+        self.update_tablist()
+
+    def tab_reordered(self, notebook, tab, index):
+        self.update_tablist()
+
+    def switch_group(self, skip):
+        tabn = self.notebook.get_current_page()
+        tab = self.notebook.get_nth_page(tabn)
+
+        params = self.tabs.setdefault(tab, {})
+
+        grp = params.setdefault("group", 0) + skip
+
+        # if the group goes beyond 0 or max
+        if grp < 0:
+            grp = max_groups - 1
+
+        if grp >= max_groups:
+            grp = 0
+
+        # if the group is zero, remove the def
+        # otherwise replace
+        if grp == 0:
+            del params["group"]
+        else:
+            params["group"] = grp
+
+        # update tab view
+        self.update_tablist()
+
+    def run(self):
+        # first initial tab
+        self.command = None
+
+        # is there any command on the cmdline?
+        if (len(sys.argv) > 1):
+                self.command=sys.argv[1:]
+
+        self.new_tab()
+        gtk.main()
+
+    def quit_request(self, *args):
+        # if there is more than one tab, ask
+        if (self.notebook.get_n_pages() > 1):
+            # ask first
+            dialog = gtk.MessageDialog(self.window, gtk.DIALOG_MODAL, \
+                gtk.MESSAGE_INFO, gtk.BUTTONS_YES_NO, "Do you really want to close?")
+
+            rv = dialog.run()
+            dialog.destroy()
+
+            if rv != gtk.RESPONSE_YES:
+                return True # cancel the quit
+
+        # TODO: Cleanup
+        gtk.main_quit()
+
+if __name__ == '__main__':
+    term = MyPixels()
+    term.run()
