@@ -110,14 +110,14 @@ class MyPixels:
         self.keybinds = [
             # Key, mods, callback, params
             # tab repositioning
-            (gtk.keysyms.Left,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_prev_tab, None),
-            (gtk.keysyms.Right, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_next_tab, None),
+            # (gtk.keysyms.Left,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_prev_tab, None),
+            # (gtk.keysyms.Right, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_next_tab, None),
             (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_prev_tab, -1),
             (gtk.keysyms.End,   gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_next_tab, -1),
 
             # tab switching
-            (gtk.keysyms.Left,  gtk.gdk.MOD1_MASK, self.prev_tab, None),
-            (gtk.keysyms.Right, gtk.gdk.MOD1_MASK, self.next_tab, None),
+            #(gtk.keysyms.Left,  gtk.gdk.MOD1_MASK, self.prev_tab, None),
+            #(gtk.keysyms.Right, gtk.gdk.MOD1_MASK, self.next_tab, None),
             (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK, self.prev_tab, -1),
             (gtk.keysyms.End,   gtk.gdk.MOD1_MASK, self.next_tab, -1),
 
