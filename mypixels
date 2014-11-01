@@ -238,7 +238,7 @@ class MyPixels:
 
         self.notebook.grab_focus()
 
-        self.forcedHideTabs = True
+        self.forcedHideTabs = False
 
         self.tabs = {}
 
